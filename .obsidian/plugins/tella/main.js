@@ -1052,9 +1052,124 @@ var GoogleGenerativeAI = class {
 // src/main.ts
 var fs = __toESM(require("fs"));
 var DEFAULT_SETTINGS = {
+  provider: "gemini",
   geminiApiKey: "",
-  transcriptionPrompt: "Transcribe the following audio, ensuring to capture every word accurately. Ignore any background noise or non-verbal sounds. The output should be a clean, readable text.",
-  modelName: "gemini-2.5-flash"
+  geminiModelName: "gemini-1.5-flash",
+  openrouterApiKey: "",
+  openrouterModelName: "openai/whisper-large-v3",
+  transcriptionPrompt: "Transcribe the following audio, ensuring to capture every word accurately. Ignore any background noise or non-verbal sounds. The output should be a clean, readable text."
+};
+var OpenRouterService = class {
+  constructor(apiKey) {
+    this.apiKey = apiKey;
+  }
+  async validateApi() {
+    var _a;
+    if (!this.apiKey) {
+      new import_obsidian.Notice("OpenRouter API key is not set.");
+      return false;
+    }
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: "https://openrouter.ai/api/v1/auth/key",
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${this.apiKey}`
+        }
+      });
+      if (response.status === 200) {
+        if (response.json && response.json.data) {
+          return true;
+        } else {
+          new import_obsidian.Notice("API key is valid but response format is unexpected.");
+          return false;
+        }
+      } else {
+        console.error("OpenRouter API validation failed:", response);
+        new import_obsidian.Notice(`OpenRouter validation failed: Status ${response.status}. Check console for details.`);
+        return false;
+      }
+    } catch (error) {
+      console.error("OpenRouter API validation request failed:", error);
+      let errorMessage = error.message || "Unknown error";
+      if (error.headers) {
+        console.error("Response Headers:", error.headers);
+      }
+      if (error.body) {
+        try {
+          const errorBody = JSON.parse(error.body);
+          errorMessage = ((_a = errorBody.error) == null ? void 0 : _a.message) || JSON.stringify(errorBody);
+        } catch (e) {
+          errorMessage = error.body;
+        }
+      }
+      new import_obsidian.Notice(`OpenRouter validation failed: ${errorMessage}. Check console for details.`);
+      return false;
+    }
+  }
+  async transcribeAudio(audioPath, modelName) {
+    var _a, _b;
+    if (!this.apiKey) {
+      throw new Error("OpenRouter API key is not configured.");
+    }
+    const audioBuffer = fs.readFileSync(audioPath);
+    const fileName = audioPath.split(/[\\/]/).pop() || "audio.dat";
+    const boundary = "----ObsidianFormBoundary" + Date.now().toString(16);
+    const contentType = `multipart/form-data; boundary=${boundary}`;
+    let data = "";
+    data += `--${boundary}\r
+`;
+    data += `Content-Disposition: form-data; name="model"\r
+\r
+`;
+    data += `${modelName}\r
+`;
+    data += `--${boundary}\r
+`;
+    data += `Content-Disposition: form-data; name="file"; filename="${fileName}"\r
+`;
+    data += `Content-Type: "application/octet-stream"\r
+\r
+`;
+    const payload = Buffer.concat([
+      Buffer.from(data, "utf-8"),
+      audioBuffer,
+      Buffer.from(`\r
+--${boundary}--\r
+`, "utf-8")
+    ]);
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: "https://openrouter.ai/api/v1/audio/transcriptions",
+        method: "POST",
+        contentType,
+        headers: {
+          "Authorization": `Bearer ${this.apiKey}`
+        },
+        body: payload
+      });
+      if (response.status !== 200) {
+        console.error("OpenRouter transcription failed:", response.json);
+        throw new Error(`OpenRouter API request failed with status ${response.status}: ${((_a = response.json.error) == null ? void 0 : _a.message) || "Unknown error"}`);
+      }
+      return response.json.text;
+    } catch (error) {
+      console.error("Error during OpenRouter transcription:", error);
+      let errorMessage = error.message || "Unknown transcription error";
+      if (error.headers) {
+        console.error("Response Headers:", error.headers);
+      }
+      if (error.body) {
+        try {
+          const errorBody = JSON.parse(error.body);
+          errorMessage = ((_b = errorBody.error) == null ? void 0 : _b.message) || JSON.stringify(errorBody);
+        } catch (e) {
+          errorMessage = error.body;
+        }
+      }
+      throw new Error(errorMessage);
+    }
+  }
 };
 var GeminiService = class {
   constructor(apiKey) {
@@ -1129,7 +1244,13 @@ var GeminiService = class {
 var Tella = class extends import_obsidian.Plugin {
   async onload() {
     await this.loadSettings();
+    if (this.settings.provider === "openrouter") {
+      this.settings.provider = "gemini";
+      await this.saveSettings();
+      console.log("Tella: Migrated provider setting from OpenRouter to Gemini.");
+    }
     this.geminiService = new GeminiService(this.settings.geminiApiKey);
+    this.openrouterService = new OpenRouterService(this.settings.openrouterApiKey);
     this.addCommand({
       id: "transcribe-audio-in-note",
       name: "Transcribe audio in note",
@@ -1145,10 +1266,16 @@ var Tella = class extends import_obsidian.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
     this.geminiService = new GeminiService(this.settings.geminiApiKey);
+    this.openrouterService = new OpenRouterService(this.settings.openrouterApiKey);
   }
   async transcribeAudioInNote() {
-    if (!this.settings.geminiApiKey) {
+    const { provider, geminiApiKey, openrouterApiKey, geminiModelName, openrouterModelName, transcriptionPrompt } = this.settings;
+    if (provider === "gemini" && !geminiApiKey) {
       new import_obsidian.Notice("Gemini API key is not set. Please configure it in the settings.");
+      return;
+    }
+    if (provider === "openrouter" && !openrouterApiKey) {
+      new import_obsidian.Notice("OpenRouter API key is not set. Please configure it in the settings.");
       return;
     }
     const activeView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
@@ -1164,7 +1291,8 @@ var Tella = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("\u672A\u627E\u5230\u97F3\u9891");
       return;
     }
-    new import_obsidian.Notice(`Found ${audioFiles.length} audio file(s). Starting transcription...`);
+    const modelInUse = provider === "gemini" ? geminiModelName : openrouterModelName;
+    new import_obsidian.Notice(`Found ${audioFiles.length} audio file(s). Starting transcription with ${provider} (${modelInUse})...`);
     const jobs = [];
     for (const match of audioFiles.reverse()) {
       const originalLink = match[0];
@@ -1173,7 +1301,7 @@ var Tella = class extends import_obsidian.Plugin {
       const startPos = editor.offsetToPos(matchIndex);
       const endPos = editor.offsetToPos(matchIndex + originalLink.length);
       const placeholderBlock = `> [!tip] Audio Note
-> \u23F3 Transcribing ${fileName}...
+> \u23F3 Transcribing ${fileName} with ${provider}...
 > ${originalLink}
 `;
       editor.replaceRange(placeholderBlock, startPos, endPos);
@@ -1214,7 +1342,12 @@ var Tella = class extends import_obsidian.Plugin {
         }
       };
       try {
-        const transcriptionText = await this.geminiService.transcribeAudio(job.filePath, this.settings.transcriptionPrompt, this.settings.modelName);
+        let transcriptionText;
+        if (provider === "gemini") {
+          transcriptionText = await this.geminiService.transcribeAudio(job.filePath, transcriptionPrompt, geminiModelName);
+        } else {
+          transcriptionText = await this.openrouterService.transcribeAudio(job.filePath, openrouterModelName);
+        }
         const formattedTranscription = transcriptionText.replace(/\n/g, "\n> ");
         const finalBlock = `> [!tip] Audio Note
 > ${formattedTranscription}
@@ -1224,7 +1357,7 @@ var Tella = class extends import_obsidian.Plugin {
       } catch (error) {
         console.error(`Error transcribing ${job.fileName}:`, error);
         const errorBlock = `> [!warning] Transcription Failed
-> Check console for details.
+> ${error.message}
 > ${job.originalLink}
 `;
         updateCallout(errorBlock);
@@ -1242,33 +1375,26 @@ var TellaSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    const apiKeySetting = new import_obsidian.Setting(containerEl).setName("Gemini API Key").setDesc("Your API key for Google Gemini.");
-    apiKeySetting.controlEl.style.width = "50%";
-    apiKeySetting.addText((text) => {
-      text.setPlaceholder("Enter your API key").setValue(this.plugin.settings.geminiApiKey).onChange(async (value) => {
-        this.plugin.settings.geminiApiKey = value;
-        await this.plugin.saveSettings();
-      });
-    }).addButton((button) => {
-      button.setButtonText("Validate").onClick(async () => {
-        new import_obsidian.Notice("Validating API key and model...");
-        const isValid = await this.plugin.geminiService.validateApi(this.plugin.settings.modelName);
-        if (isValid) {
-          new import_obsidian.Notice("API key and model are valid!");
-        } else {
-          new import_obsidian.Notice("API validation failed. Check key, model, and console for details.");
-        }
-      });
-    });
-    const modelNameSetting = new import_obsidian.Setting(containerEl).setName("Model Name").setDesc("The Gemini model to use for transcription.");
-    modelNameSetting.controlEl.style.width = "50%";
-    modelNameSetting.addText((text) => {
-      text.setPlaceholder("e.g., gemini-2.5-flash").setValue(this.plugin.settings.modelName).onChange(async (value) => {
-        this.plugin.settings.modelName = value;
-        await this.plugin.saveSettings();
-      });
-    });
-    const promptSetting = new import_obsidian.Setting(containerEl).setName("Transcription Prompt").setDesc("The prompt to use when transcribing audio.");
+    containerEl.createEl("h2", { text: "General Settings" });
+    containerEl.createEl("h3", { text: "Gemini Settings" });
+    const geminiApiKeySetting = new import_obsidian.Setting(containerEl).setName("Gemini API Key").setDesc("Your API key for Google Gemini.");
+    const geminiApiKeyInput = geminiApiKeySetting.addText((text) => text.setPlaceholder("Enter your Gemini API key").setValue(this.plugin.settings.geminiApiKey).onChange(async (value) => {
+      this.plugin.settings.geminiApiKey = value;
+      await this.plugin.saveSettings();
+    }));
+    geminiApiKeySetting.addButton((button) => button.setButtonText("Validate").onClick(async () => {
+      new import_obsidian.Notice("Validating Gemini API key...");
+      const isValid = await this.plugin.geminiService.validateApi(this.plugin.settings.geminiModelName);
+      if (isValid) {
+        new import_obsidian.Notice("Gemini API key is valid!");
+      }
+    }));
+    new import_obsidian.Setting(containerEl).setName("Gemini Model Name").setDesc("The Gemini model to use for transcription.").addText((text) => text.setPlaceholder("e.g., gemini-1.5-flash").setValue(this.plugin.settings.geminiModelName).onChange(async (value) => {
+      this.plugin.settings.geminiModelName = value;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h2", { text: "Common Settings" });
+    const promptSetting = new import_obsidian.Setting(containerEl).setName("Transcription Prompt").setDesc("The prompt to use when transcribing audio. This is used by Gemini but not by OpenRouter Whisper models.");
     promptSetting.controlEl.style.width = "50%";
     promptSetting.addTextArea((text) => {
       text.setPlaceholder("Enter your prompt").setValue(this.plugin.settings.transcriptionPrompt).onChange(async (value) => {

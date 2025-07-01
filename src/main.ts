@@ -1,18 +1,137 @@
-import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
+import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, TFile, requestUrl } from 'obsidian';
 import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
 import * as fs from 'fs';
 
 interface TellaSettings {
+	provider: 'gemini' | 'openrouter';
 	geminiApiKey: string;
+	geminiModelName: string;
+	openrouterApiKey: string;
+	openrouterModelName: string;
 	transcriptionPrompt: string;
-	modelName: string;
 }
 
 const DEFAULT_SETTINGS: TellaSettings = {
+	provider: 'gemini',
 	geminiApiKey: '',
+	geminiModelName: 'gemini-1.5-flash',
+	openrouterApiKey: '',
+	openrouterModelName: 'openai/whisper-large-v3',
 	transcriptionPrompt: 'Transcribe the following audio, ensuring to capture every word accurately. Ignore any background noise or non-verbal sounds. The output should be a clean, readable text.',
-	modelName: 'gemini-2.5-flash',
 };
+
+class OpenRouterService {
+	private apiKey: string;
+
+	constructor(apiKey: string) {
+		this.apiKey = apiKey;
+	}
+
+	async validateApi(): Promise<boolean> {
+		if (!this.apiKey) {
+			new Notice('OpenRouter API key is not set.');
+			return false;
+		}
+		try {
+			const response = await requestUrl({
+				url: 'https://openrouter.ai/api/v1/auth/key',
+				method: 'GET',
+				headers: {
+					'Authorization': `Bearer ${this.apiKey}`,
+				},
+			});
+
+			if (response.status === 200) {
+				// The response for a valid key is { "data": { ... } } or similar.
+				if (response.json && response.json.data) {
+					return true;
+				} else {
+					new Notice('API key is valid but response format is unexpected.');
+					return false;
+				}
+			} else {
+				console.error('OpenRouter API validation failed:', response);
+				new Notice(`OpenRouter validation failed: Status ${response.status}. Check console for details.`);
+				return false;
+			}
+		} catch (error) {
+			console.error('OpenRouter API validation request failed:', error);
+			let errorMessage = error.message || 'Unknown error';
+			if (error.headers) {
+				console.error('Response Headers:', error.headers);
+			}
+			if (error.body) {
+				try {
+					const errorBody = JSON.parse(error.body);
+					errorMessage = errorBody.error?.message || JSON.stringify(errorBody);
+				} catch (e) {
+					errorMessage = error.body;
+				}
+			}
+			new Notice(`OpenRouter validation failed: ${errorMessage}. Check console for details.`);
+			return false;
+		}
+	}
+
+	async transcribeAudio(audioPath: string, modelName: string): Promise<string> {
+		if (!this.apiKey) {
+			throw new Error("OpenRouter API key is not configured.");
+		}
+
+		const audioBuffer = fs.readFileSync(audioPath);
+		const fileName = audioPath.split(/[\\/]/).pop() || 'audio.dat';
+		const boundary = '----ObsidianFormBoundary' + Date.now().toString(16);
+		const contentType = `multipart/form-data; boundary=${boundary}`;
+
+		let data = '';
+		data += `--${boundary}\r\n`;
+		data += `Content-Disposition: form-data; name="model"\r\n\r\n`;
+		data += `${modelName}\r\n`;
+		data += `--${boundary}\r\n`;
+		data += `Content-Disposition: form-data; name="file"; filename="${fileName}"\r\n`;
+		data += `Content-Type: "application/octet-stream"\r\n\r\n`;
+
+		const payload = Buffer.concat([
+			Buffer.from(data, 'utf-8'),
+			audioBuffer,
+			Buffer.from(`\r\n--${boundary}--\r\n`, 'utf-8'),
+		]);
+
+		try {
+			const response = await requestUrl({
+				url: 'https://openrouter.ai/api/v1/audio/transcriptions',
+				method: 'POST',
+				contentType: contentType,
+				headers: {
+					'Authorization': `Bearer ${this.apiKey}`,
+				},
+				body: payload,
+			});
+
+			if (response.status !== 200) {
+				console.error('OpenRouter transcription failed:', response.json);
+				throw new Error(`OpenRouter API request failed with status ${response.status}: ${response.json.error?.message || 'Unknown error'}`);
+			}
+
+			return response.json.text;
+		} catch (error) {
+			console.error('Error during OpenRouter transcription:', error);
+			let errorMessage = error.message || 'Unknown transcription error';
+			if (error.headers) {
+				console.error('Response Headers:', error.headers);
+			}
+			if (error.body) {
+				try {
+					const errorBody = JSON.parse(error.body);
+					errorMessage = errorBody.error?.message || JSON.stringify(errorBody);
+				} catch (e) {
+					errorMessage = error.body;
+				}
+			}
+			throw new Error(errorMessage);
+		}
+	}
+}
 
 class GeminiService {
 	private apiKey: string;
@@ -89,10 +208,19 @@ class GeminiService {
 export default class Tella extends Plugin {
 	settings: TellaSettings;
 	geminiService: GeminiService;
+	openrouterService: OpenRouterService;
 
 	async onload() {
 		await this.loadSettings();
+
+		// Migration: If OpenRouter was selected, revert to Gemini as it's no longer supported for transcription.
+		if (this.settings.provider === 'openrouter') {
+			this.settings.provider = 'gemini';
+			await this.saveSettings();
+			console.log('Tella: Migrated provider setting from OpenRouter to Gemini.');
+		}
 		this.geminiService = new GeminiService(this.settings.geminiApiKey);
+		this.openrouterService = new OpenRouterService(this.settings.openrouterApiKey);
 
 		this.addCommand({
 			id: 'transcribe-audio-in-note',
@@ -111,13 +239,20 @@ export default class Tella extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
-		// Re-initialize GeminiService with the new API key
+		// Re-initialize services with new settings
 		this.geminiService = new GeminiService(this.settings.geminiApiKey);
+		this.openrouterService = new OpenRouterService(this.settings.openrouterApiKey);
 	}
 
 	async transcribeAudioInNote() {
-		if (!this.settings.geminiApiKey) {
+		const { provider, geminiApiKey, openrouterApiKey, geminiModelName, openrouterModelName, transcriptionPrompt } = this.settings;
+
+		if (provider === 'gemini' && !geminiApiKey) {
 			new Notice('Gemini API key is not set. Please configure it in the settings.');
+			return;
+		}
+		if (provider === 'openrouter' && !openrouterApiKey) {
+			new Notice('OpenRouter API key is not set. Please configure it in the settings.');
 			return;
 		}
 
@@ -137,7 +272,8 @@ export default class Tella extends Plugin {
 			return;
 		}
 
-		new Notice(`Found ${audioFiles.length} audio file(s). Starting transcription...`);
+		const modelInUse = provider === 'gemini' ? geminiModelName : openrouterModelName;
+		new Notice(`Found ${audioFiles.length} audio file(s). Starting transcription with ${provider} (${modelInUse})...`);
 
 		const jobs: any[] = [];
 		// Step 1: Sequentially create placeholders and collect jobs to avoid race conditions on editor positions.
@@ -149,7 +285,7 @@ export default class Tella extends Plugin {
 			const startPos = editor.offsetToPos(matchIndex);
 			const endPos = editor.offsetToPos(matchIndex + originalLink.length);
 
-			const placeholderBlock = `> [!tip] Audio Note\n> ⏳ Transcribing ${fileName}...\n> ${originalLink}\n`;
+			const placeholderBlock = `> [!tip] Audio Note\n> ⏳ Transcribing ${fileName} with ${provider}...\n> ${originalLink}\n`;
 			editor.replaceRange(placeholderBlock, startPos, endPos);
 
 			if (!activeView.file) {
@@ -187,13 +323,19 @@ export default class Tella extends Plugin {
 			};
 
 			try {
-				const transcriptionText = await this.geminiService.transcribeAudio(job.filePath, this.settings.transcriptionPrompt, this.settings.modelName);
+				let transcriptionText: string;
+				if (provider === 'gemini') {
+					transcriptionText = await this.geminiService.transcribeAudio(job.filePath, transcriptionPrompt, geminiModelName);
+				} else { // openrouter
+					transcriptionText = await this.openrouterService.transcribeAudio(job.filePath, openrouterModelName);
+				}
+
 				const formattedTranscription = transcriptionText.replace(/\n/g, '\n> ');
 				const finalBlock = `> [!tip] Audio Note\n> ${formattedTranscription}\n> ${job.originalLink}\n`;
 				updateCallout(finalBlock);
 			} catch (error) {
 				console.error(`Error transcribing ${job.fileName}:`, error);
-				const errorBlock = `> [!warning] Transcription Failed\n> Check console for details.\n> ${job.originalLink}\n`;
+				const errorBlock = `> [!warning] Transcription Failed\n> ${error.message}\n> ${job.originalLink}\n`;
 				updateCallout(errorBlock);
 			}
 		});
@@ -216,55 +358,107 @@ class TellaSettingTab extends PluginSettingTab {
 
 		containerEl.empty();
 
-		// API Key Setting
-		const apiKeySetting = new Setting(containerEl)
+		containerEl.createEl('h2', { text: 'General Settings' });
+
+		// // Provider Setting
+		// new Setting(containerEl)
+		// 	.setName('Provider')
+		// 	.setDesc('Choose your AI service provider.')
+		// 	.addDropdown(dropdown => dropdown
+		// 		.addOption('gemini', 'Gemini')
+		// 		.addOption('openrouter', 'OpenRouter')
+		// 		.setValue(this.plugin.settings.provider)
+		// 		.onChange(async (value: 'gemini' | 'openrouter') => {
+		// 			this.plugin.settings.provider = value;
+		// 			await this.plugin.saveSettings();
+		// 			this.display(); // Refresh settings to show/hide relevant fields
+		// 		}));
+
+		// Gemini Settings Group
+		// if (this.plugin.settings.provider === 'gemini') {
+		containerEl.createEl('h3', { text: 'Gemini Settings' });
+		// Gemini API Key Setting
+		const geminiApiKeySetting = new Setting(containerEl)
 			.setName('Gemini API Key')
 			.setDesc('Your API key for Google Gemini.');
-		
-		apiKeySetting.controlEl.style.width = '50%';
-		apiKeySetting.addText(text => {
-			text
-				.setPlaceholder('Enter your API key')
-				.setValue(this.plugin.settings.geminiApiKey)
-				.onChange(async (value) => {
-					this.plugin.settings.geminiApiKey = value;
-					await this.plugin.saveSettings();
-				});
-		})
-		.addButton(button => {
-			button
-				.setButtonText('Validate')
-				.onClick(async () => {
-					new Notice('Validating API key and model...');
-					const isValid = await this.plugin.geminiService.validateApi(this.plugin.settings.modelName);
+
+		const geminiApiKeyInput = geminiApiKeySetting.addText(text => text
+			.setPlaceholder('Enter your Gemini API key')
+			.setValue(this.plugin.settings.geminiApiKey)
+			.onChange(async (value) => {
+				this.plugin.settings.geminiApiKey = value;
+				await this.plugin.saveSettings();
+			}));
+
+		geminiApiKeySetting.addButton(button => button
+			.setButtonText('Validate')
+			.onClick(async () => {
+					new Notice('Validating Gemini API key...');
+					const isValid = await this.plugin.geminiService.validateApi(this.plugin.settings.geminiModelName);
 					if (isValid) {
-						new Notice('API key and model are valid!');
-					} else {
-						new Notice('API validation failed. Check key, model, and console for details.');
+						new Notice('Gemini API key is valid!');
 					}
-				});
-		});
+					// Error notice is handled within validateApi
+				}));
 
-		// Model Name Setting
-		const modelNameSetting = new Setting(containerEl)
-			.setName('Model Name')
-			.setDesc('The Gemini model to use for transcription.');
-		
-		modelNameSetting.controlEl.style.width = '50%';
-		modelNameSetting.addText(text => {
-			text
-				.setPlaceholder('e.g., gemini-2.5-flash')
-				.setValue(this.plugin.settings.modelName)
+		// Gemini Model Name Setting
+		new Setting(containerEl)
+			.setName('Gemini Model Name')
+			.setDesc('The Gemini model to use for transcription.')
+			.addText(text => text
+				.setPlaceholder('e.g., gemini-1.5-flash')
+				.setValue(this.plugin.settings.geminiModelName)
 				.onChange(async (value) => {
-					this.plugin.settings.modelName = value;
+					this.plugin.settings.geminiModelName = value;
 					await this.plugin.saveSettings();
-				});
-		});
+				}));
+		// }
 
-		// Prompt Setting
+		// // OpenRouter Settings Group
+		// if (this.plugin.settings.provider === 'openrouter') {
+		// 	containerEl.createEl('h3', { text: 'OpenRouter Settings' });
+		// 	// OpenRouter API Key Setting
+		// 	const openrouterApiKeySetting = new Setting(containerEl)
+		// 		.setName('OpenRouter API Key')
+		// 		.setDesc('Your API key for OpenRouter.');
+
+		// 	const openrouterApiKeyInput = openrouterApiKeySetting.addText(text => text
+		// 		.setPlaceholder('Enter your OpenRouter API key')
+		// 		.setValue(this.plugin.settings.openrouterApiKey)
+		// 		.onChange(async (value) => {
+		// 			this.plugin.settings.openrouterApiKey = value;
+		// 			await this.plugin.saveSettings();
+		// 		}));
+
+		// 	openrouterApiKeySetting.addButton(button => button
+		// 		.setButtonText('Validate')
+		// 		.onClick(async () => {
+		// 			const isValid = await this.plugin.openrouterService.validateApi();
+		// 			if (isValid) {
+		// 				new Notice('OpenRouter API key is valid!');
+		// 			}
+		// 		}));
+
+		// 	// OpenRouter Model Name Setting
+		// 	new Setting(containerEl)
+		// 		.setName('OpenRouter Model Name')
+		// 		.setDesc('The model to use for transcription (e.g., openai/whisper-large-v3).')
+		// 		.addText(text => text
+		// 			.setPlaceholder('e.g., openai/whisper-large-v3')
+		// 			.setValue(this.plugin.settings.openrouterModelName)
+		// 			.onChange(async (value) => {
+		// 				this.plugin.settings.openrouterModelName = value;
+		// 				await this.plugin.saveSettings();
+		// 			}));
+		// }
+
+
+		// Common Settings
+		containerEl.createEl('h2', { text: 'Common Settings' });
+
 		const promptSetting = new Setting(containerEl)
 			.setName('Transcription Prompt')
-			.setDesc('The prompt to use when transcribing audio.');
+			.setDesc('The prompt to use when transcribing audio. This is used by Gemini but not by OpenRouter Whisper models.');
 
 		promptSetting.controlEl.style.width = '50%';
 		promptSetting.addTextArea(text => {
