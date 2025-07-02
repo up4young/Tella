@@ -20,6 +20,6 @@ dist/
 *.zip
 
 # Obsidian vault
-.obsidian/
-docs/
+.obsidian
+docs
 
