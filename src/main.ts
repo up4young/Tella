@@ -460,7 +460,7 @@ class TellaSettingTab extends PluginSettingTab {
 			.setName('Transcription Prompt')
 			.setDesc('The prompt to use when transcribing audio. This is used by Gemini but not by OpenRouter Whisper models.');
 
-		promptSetting.controlEl.style.width = '50%';
+		promptSetting.controlEl.className = 'tella-prompt-setting-control';
 		promptSetting.addTextArea(text => {
 			text
 				.setPlaceholder('Enter your prompt')
@@ -469,8 +469,7 @@ class TellaSettingTab extends PluginSettingTab {
 					this.plugin.settings.transcriptionPrompt = value;
 					await this.plugin.saveSettings();
 				});
-			text.inputEl.style.height = '100px';
+			text.inputEl.className = 'tella-transcription-prompt-textarea';
 		});
 	}
 }
-

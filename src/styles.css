@@ -1,0 +1,10 @@
+/* Tella Plugin Styles */
+
+/* Settings tab styles */
+.tella-prompt-setting-control {
+    width: 50%;
+}
+
+.tella-transcription-prompt-textarea {
+    height: 100px;
+}

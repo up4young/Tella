@@ -45,5 +45,6 @@ esbuild.build({
 	outfile: path.join(outdir, "main.js"),
 }).then(() => {
     fs.copyFileSync("manifest.json", path.join(outdir, "manifest.json"));
-    console.log("manifest.json copied to " + outdir);
+    fs.copyFileSync("src/styles.css", path.join(outdir, "styles.css"));
+    console.log("manifest.json and styles.css copied to " + outdir);
 }).catch(() => process.exit(1));
